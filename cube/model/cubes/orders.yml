@@ -1,0 +1,66 @@
+# Demo cube backed by the Athena table created by the CDK stack (sample-data/orders/orders.csv).
+# Replace this folder with your own data model when you connect your own data source.
+cubes:
+  - name: orders
+    sql_table: "{{ env_var('CUBE_DEMO_GLUE_DATABASE') | safe }}.orders"
+    description: E-commerce orders (synthetic demo data)
+
+    measures:
+      - name: count
+        type: count
+      - name: total_amount
+        sql: amount
+        type: sum
+        format: currency
+      - name: avg_amount
+        sql: amount
+        type: avg
+        format: currency
+      - name: total_quantity
+        sql: quantity
+        type: sum
+      - name: customers
+        sql: customer_id
+        type: count_distinct_approx
+
+    dimensions:
+      - name: order_id
+        sql: order_id
+        type: number
+        primary_key: true
+      - name: created_at
+        sql: created_at
+        type: time
+      - name: status
+        sql: status
+        type: string
+      - name: product_category
+        sql: product_category
+        type: string
+      - name: region
+        sql: region
+        type: string
+      - name: customer_id
+        sql: customer_id
+        type: number
+
+    segments:
+      - name: completed
+        sql: "{CUBE}.status = 'completed'"
+
+    pre_aggregations:
+      # Built by the refresh worker into Cube Store (backed by S3), served to API instances.
+      - name: daily_by_category_region
+        measures:
+          - count
+          - total_amount
+          - total_quantity
+        dimensions:
+          - status
+          - product_category
+          - region
+        time_dimension: created_at
+        granularity: day
+        partition_granularity: month
+        refresh_key:
+          every: 1 hour

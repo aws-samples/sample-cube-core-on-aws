@@ -1,0 +1,15 @@
+views:
+  - name: orders_view
+    description: Orders analytics view for BI tools and AI agents
+    cubes:
+      - join_path: orders
+        includes:
+          - count
+          - total_amount
+          - avg_amount
+          - total_quantity
+          - customers
+          - created_at
+          - status
+          - product_category
+          - region

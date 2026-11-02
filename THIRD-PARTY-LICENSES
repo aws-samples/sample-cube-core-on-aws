@@ -1,0 +1,51 @@
+This sample does not vendor or redistribute third-party source code, datasets or model weights.
+It declares the following third-party components as dependencies. They are downloaded by the
+user at build or deploy time and are governed by their own licenses.
+
+Infrastructure (infra/) - exact versions in infra/package.json, full set in infra/package-lock.json
+---------------------------------------------------------------------------------------------------
+aws-cdk-lib 2.275.0           Apache-2.0      https://github.com/aws/aws-cdk
+constructs 10.8.1             Apache-2.0      https://github.com/aws/constructs
+cdk-nag 3.0.2                 Apache-2.0      https://github.com/cdklabs/cdk-nag
+cdk-ecr-deployment 4.2.76     Apache-2.0      https://github.com/cdklabs/cdk-ecr-deployment
+aws-cdk 2.1146.1              Apache-2.0      https://github.com/aws/aws-cdk-cli          (dev)
+typescript 5.9.3              Apache-2.0      https://github.com/microsoft/TypeScript     (dev)
+esbuild 0.28.2                MIT             https://github.com/evanw/esbuild            (dev)
+tsx 4.23.15                   MIT             https://github.com/privatenumber/tsx        (dev)
+@types/node 22.20.5           MIT             https://github.com/DefinitelyTyped/DefinitelyTyped (dev)
+
+MCP server (mcp-server/) - exact versions in mcp-server/package.json, full set in package-lock.json
+---------------------------------------------------------------------------------------------------
+@modelcontextprotocol/sdk 1.32.2  MIT         https://github.com/modelcontextprotocol/typescript-sdk
+zod 4.6.7                     MIT             https://github.com/colinhacks/zod
+typescript 5.9.3              Apache-2.0      https://github.com/microsoft/TypeScript     (dev)
+esbuild 0.28.2                MIT             https://github.com/evanw/esbuild            (dev)
+tsx 4.23.15                   MIT             https://github.com/privatenumber/tsx        (dev)
+@types/node 22.20.5           MIT             https://github.com/DefinitelyTyped/DefinitelyTyped (dev)
+@types/aws-lambda 8.10.164    MIT             https://github.com/DefinitelyTyped/DefinitelyTyped (dev)
+
+Transitive dependencies
+---------------------------------------------------------------------------------------------------
+The MCP server's runtime dependency tree (the parts it imports are bundled into the Lambda
+function by esbuild) contains about 95 packages, all under permissive licenses (MIT, ISC,
+BSD-2-Clause, BSD-3-Clause). The infra/ runtime set contains Apache-2.0, MIT, ISC and
+BlueOak-1.0.0 (minimatch) packages, plus "case" (bundled in aws-cdk-lib), dual-licensed
+MIT OR GPL-3.0-or-later and used under MIT. The infra/ packages themselves run on the
+deployer's machine at synth time; the only parts deployed to AWS are the custom-resource
+Lambda handlers and layers shipped inside aws-cdk-lib (e.g. S3 BucketDeployment with its
+AWS CLI layer, S3 auto-delete, default security group restriction) and cdk-ecr-deployment
+(image copy), all distributed under Apache-2.0 by those projects.
+No GPL, LGPL or AGPL licensed packages are used under those licenses.
+
+Container images (pulled from their public registries and mirrored into the user's own Amazon
+ECR at deploy time; not redistributed by this sample)
+---------------------------------------------------------------------------------------------------
+docker.io/cubejs/cube:v1.8.13          Apache-2.0  https://github.com/cube-js/cube
+docker.io/cubejs/cubestore:v1.8.13     Apache-2.0  https://github.com/cube-js/cube
+public.ecr.aws/aws-cli/aws-cli:2.38.6  Apache-2.0  https://github.com/aws/aws-cli
+The images also contain operating system packages under their own licenses.
+
+Sample data
+---------------------------------------------------------------------------------------------------
+sample-data/orders/orders.csv is synthetic data generated for this sample. It contains no real
+customer, personal or third-party data.

@@ -1,0 +1,60 @@
+{
+  "$comment": "Copy to config.json and edit. See README.md -> 'Configuration reference' for every field.",
+  "stackName": "CubeCore",
+  "region": "us-east-1",
+  "environment": "dev",
+
+  "cubeVersion": "v1.8.13",
+
+  "network": {
+    "vpcId": "",
+    "vpcCidr": "10.80.0.0/16",
+    "maxAzs": 2,
+    "natGateways": 1,
+    "vpcEndpoints": true
+  },
+
+  "access": {
+    "allowedCidrs": [],
+    "rateLimitPer5Min": 2000,
+    "geoAllowList": [],
+    "customDomain": {
+      "domainName": "",
+      "certificateArn": ""
+    }
+  },
+
+  "cube": {
+    "api": { "cpu": 1024, "memoryMiB": 2048, "minCount": 2, "maxCount": 6 },
+    "refreshWorker": { "cpu": 1024, "memoryMiB": 2048 },
+    "cubestoreRouter": { "cpu": 1024, "memoryMiB": 4096 },
+    "cubestoreWorker": { "cpu": 1024, "memoryMiB": 4096, "count": 2, "ephemeralStorageGiB": 50 },
+    "jwt": {
+      "jwkUrl": "",
+      "issuer": "",
+      "audience": "",
+      "algorithms": "RS256",
+      "claimsNamespace": ""
+    },
+    "extraEnv": {},
+    "enableExecuteCommand": false
+  },
+
+  "dataSource": {
+    "type": "athena-demo",
+    "env": {},
+    "secretArn": "",
+    "secretEnv": {}
+  },
+
+  "sqlApi": {
+    "enabled": false,
+    "allowedCidrs": []
+  },
+
+  "mcp": {
+    "enabled": true
+  },
+
+  "alarmEmail": ""
+}

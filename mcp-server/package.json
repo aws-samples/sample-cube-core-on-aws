@@ -1,0 +1,28 @@
+{
+  "name": "cube-mcp-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MCP server for Cube Core REST API (stdio for local use, Streamable HTTP on AWS Lambda)",
+  "type": "module",
+  "bin": {
+    "cube-mcp-server": "dist/stdio.mjs"
+  },
+  "scripts": {
+    "build": "esbuild src/stdio.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/stdio.mjs --banner:js=\"#!/usr/bin/env node\nimport { createRequire } from 'module'; const require = createRequire(import.meta.url);\"",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "start": "node dist/stdio.mjs"
+  },
+  "license": "MIT-0",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "8.10.164",
+    "@types/node": "22.20.5",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+cdk.out/
+dist/
+config.json
+infra/cdk-outputs.json
+infra/cdk.context.json
+upstream/
+*.log
+.DS_Store
