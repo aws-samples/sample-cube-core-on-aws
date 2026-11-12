@@ -14,6 +14,10 @@ export interface McpProps {
   alb: elbv2.ApplicationLoadBalancer;
   listener: elbv2.ApplicationListener;
   albSecurityGroup: ec2.SecurityGroup;
+  /** Cube API base URL as seen from inside the VPC (https://<originTls.domainName> or http://<ALB DNS>). */
+  apiUrl: string;
+  /** ALB listener port (443 with origin TLS, else 80). */
+  port: number;
 }
 
 /**
@@ -28,8 +32,8 @@ export class McpEndpoint extends Construct {
     const { foundation } = props;
 
     const sg = new ec2.SecurityGroup(this, 'Sg', { vpc: foundation.vpc, description: 'Cube MCP Lambda', allowAllOutbound: false });
-    sg.addEgressRule(props.albSecurityGroup, ec2.Port.tcp(80), 'MCP Lambda to internal ALB (Cube API)');
-    props.albSecurityGroup.addIngressRule(sg, ec2.Port.tcp(80), 'MCP Lambda to Cube API');
+    sg.addEgressRule(props.albSecurityGroup, ec2.Port.tcp(props.port), 'MCP Lambda to internal ALB (Cube API)');
+    props.albSecurityGroup.addIngressRule(sg, ec2.Port.tcp(props.port), 'MCP Lambda to Cube API');
 
     this.fn = new nodejs.NodejsFunction(this, 'Function', {
       description: 'Cube MCP server (Streamable HTTP, stateless)',
@@ -46,7 +50,7 @@ export class McpEndpoint extends Construct {
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [sg],
       environment: {
-        CUBE_API_URL: `http://${props.alb.loadBalancerDnsName}`,
+        CUBE_API_URL: props.apiUrl,
         NODE_OPTIONS: '--enable-source-maps',
       },
       environmentEncryption: foundation.key,

@@ -57,6 +57,14 @@ test('rejects requests without a bearer token', async () => {
   assert.equal(res.statusCode, 401);
 });
 
+test('rejects initialize / tools/list with a token Cube does not accept', async () => {
+  for (const method of ['initialize', 'tools/list']) {
+    const res = await call({ jsonrpc: '2.0', id: 1, method, params: {} }, 'bad-token');
+    assert.equal(res.statusCode, 401, method);
+  }
+  seenAuth.length = 0; // later tests assert that only the good token reached Cube
+});
+
 test('initialize + tools/list', async () => {
   const init = await call({
     jsonrpc: '2.0', id: 1, method: 'initialize',

@@ -5,6 +5,7 @@
   "description": "AWS CDK app that deploys Cube Core on Amazon ECS Fargate",
   "scripts": {
     "build": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
     "synth": "cdk synth",
     "cdk": "cdk"
   },

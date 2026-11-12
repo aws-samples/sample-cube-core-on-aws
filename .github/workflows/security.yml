@@ -1,0 +1,24 @@
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * 1' # weekly, to catch new advisories against unchanged lock files
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # npm audit + type checks + tests + offline cdk synth with cdk-nag. No AWS credentials are used.
+      - run: scripts/security-check.sh
