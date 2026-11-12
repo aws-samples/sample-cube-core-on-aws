@@ -44,6 +44,17 @@ export class CubeClient {
     return this.request('POST', '/cubejs-api/v1/sql', { query });
   }
 
+  /** Asks Cube to verify the token. false = Cube rejected it (401/403); other failures throw. */
+  async verifyToken(): Promise<boolean> {
+    try {
+      await this.request('GET', '/cubejs-api/v1/meta');
+      return true;
+    } catch (err) {
+      if (err instanceof CubeApiError && (err.status === 401 || err.status === 403)) return false;
+      throw err;
+    }
+  }
+
   /** Sends a request and transparently polls while Cube answers {"error":"Continue wait"}. */
   private async request(method: 'GET' | 'POST', path: string, body?: unknown): Promise<any> {
     const deadline = Date.now() + this.timeoutMs;

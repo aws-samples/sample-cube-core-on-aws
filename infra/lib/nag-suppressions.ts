@@ -6,7 +6,7 @@ const ack = (stack: Stack, rules: { id: string; reason: string }[]) => {
 };
 
 /** Documented, reviewed exceptions to cdk-nag AwsSolutions rules. */
-export function applyNagSuppressions(main: Stack, waf: Stack, config: CubeOnAwsConfig): void {
+export function applyNagSuppressions(main: Stack, waf: Stack | undefined, config: CubeOnAwsConfig): void {
   const glueDb = `cube_demo_${config.stackName.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
   ack(main, [
     { id: 'AwsSolutions-L1', reason: 'Runtime of CDK-provided helper Lambdas is managed by the CDK/construct library; the MCP Lambda uses Node.js 22.' },
@@ -18,6 +18,13 @@ export function applyNagSuppressions(main: Stack, waf: Stack, config: CubeOnAwsC
     { id: 'AwsSolutions-ELB2', reason: 'ALB access logging is enabled; NLB (optional SQL API) uses plain TCP listeners for which access logs are not available.' },
     { id: 'AwsSolutions-EC23', reason: 'Ingress is limited to the CloudFront origin-facing managed prefix list, specific security groups, or the configured sqlApi.allowedCidrs.' },
   ]);
+  // Only when the operator turns these off on purpose (config.json security.* or deploy.sh --no-*).
+  if (!config.security.waf) {
+    ack(main, [{ id: 'AwsSolutions-CFR2', reason: 'security.waf=false was set by the operator (e.g. a central WAF / Firewall Manager policy already covers this distribution). Every API call still needs a valid Cube JWT.' }]);
+  }
+  if (!config.security.vpcFlowLogs) {
+    ack(main, [{ id: 'AwsSolutions-VPC7', reason: 'security.vpcFlowLogs=false was set by the operator (e.g. flow logs are already collected centrally for this VPC).' }]);
+  }
   // Granular IAM findings: S3/KMS grant helpers (bucket.grantRead/grantReadWrite) emit
   // wildcard actions/object ARNs, all scoped to buckets and keys created by this stack.
   const iam5 = [
@@ -45,7 +52,7 @@ export function applyNagSuppressions(main: Stack, waf: Stack, config: CubeOnAwsC
     });
   }
 
-  ack(waf, [
+  if (waf) ack(waf, [
     { id: 'AwsSolutions-IAM4', reason: 'CDK cross-region reference helpers use AWS managed policies.' },
     { id: 'AwsSolutions-IAM5', reason: 'CDK cross-region reference helpers need wildcard SSM parameter access under /cdk/exports/.' },
     { id: 'AwsSolutions-L1', reason: 'CDK-provided helper Lambda runtime is managed by CDK.' },

@@ -124,6 +124,8 @@ export class AthenaDemo extends Construct {
       }),
     );
     this.dataBucket.grantRead(role);
-    this.resultsBucket.grantReadWrite(role);
+    // Athena writes results with the caller's credentials; Cube never deletes them (lifecycle does).
+    this.resultsBucket.grantRead(role);
+    this.resultsBucket.grantPut(role);
   }
 }

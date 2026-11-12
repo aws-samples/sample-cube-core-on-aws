@@ -10,6 +10,8 @@ import * as cwActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
@@ -23,12 +25,14 @@ import { CubeStore } from './constructs/cubestore';
 import { Foundation } from './constructs/foundation';
 import { ImageMirror } from './constructs/images';
 import { McpEndpoint } from './constructs/mcp';
+import { SecurityServices } from './constructs/security';
 
 export const AWS_CLI_IMAGE_TAG = '2.38.6';
 
 export interface CubeStackProps extends StackProps {
   config: CubeOnAwsConfig;
-  webAclArn: string;
+  /** Undefined when security.waf is false. */
+  webAclArn?: string;
 }
 
 /** Deterministic hash of a folder's contents (relative paths + bytes). */
@@ -57,7 +61,7 @@ export class CubeStack extends Stack {
     const { vpc, key } = foundation;
 
     // ---- Images (mirrored into private ECR)
-    const mirror = new ImageMirror(this, 'Images', { removalPolicy: foundation.removalPolicy });
+    const mirror = new ImageMirror(this, 'Images', { removalPolicy: foundation.removalPolicy, encryptionKey: key });
     const cubeImage = mirror.mirror('Cube', 'docker.io/cubejs/cube', config.cubeVersion);
     const cubestoreImage = mirror.mirror('CubeStore', 'docker.io/cubejs/cubestore', config.cubeVersion);
     const awsCliImage = mirror.mirror('AwsCli', 'public.ecr.aws/aws-cli/aws-cli', AWS_CLI_IMAGE_TAG);
@@ -115,12 +119,16 @@ export class CubeStack extends Stack {
 
     const cubestore = new CubeStore(this, 'CubeStore', { config, foundation, cluster, namespace, image: cubestoreImage });
 
-    // ALB security group: only CloudFront origin-facing servers (VPC origin) can reach port 80.
+    // Optional TLS for CloudFront -> ALB and MCP Lambda -> ALB (access.originTls).
+    const originTls = config.access.originTls.domainName ? config.access.originTls : undefined;
+    const originPort = originTls ? 443 : 80;
+
+    // ALB security group: only CloudFront origin-facing servers (VPC origin) can reach the listener port.
     const albSg = new ec2.SecurityGroup(this, 'AlbSg', { vpc, description: 'Cube internal ALB', allowAllOutbound: false });
     const cfPrefixList = ec2.PrefixList.fromLookup(this, 'CloudFrontOriginFacing', {
       prefixListName: 'com.amazonaws.global.cloudfront.origin-facing',
     });
-    albSg.addIngressRule(ec2.Peer.prefixList(cfPrefixList.prefixListId), ec2.Port.tcp(80), 'CloudFront VPC origin');
+    albSg.addIngressRule(ec2.Peer.prefixList(cfPrefixList.prefixListId), ec2.Port.tcp(originPort), 'CloudFront VPC origin');
 
     const services = new CubeServices(this, 'Cube', {
       config,
@@ -136,6 +144,7 @@ export class CubeStack extends Stack {
       confHash: hashDir(PATHS.cubeConf),
       dataSourceEnv,
       albSecurityGroup: albSg,
+      originCertificate: originTls ? acm.Certificate.fromCertificateArn(this, 'OriginCert', originTls.certificateArn) : undefined,
     });
     services.apiService.node.addDependency(confDeployment);
     services.refreshService.node.addDependency(confDeployment);
@@ -143,8 +152,16 @@ export class CubeStack extends Stack {
     athenaDemo?.grantQuery(services.taskRole);
     key.grantDecrypt(services.taskRole);
 
+    // With origin TLS, a private hosted zone makes originTls.domainName resolve to the ALB inside the VPC,
+    // so the MCP Lambda can verify the certificate. CloudFront VPC origins do not need public DNS.
+    if (originTls) {
+      const zone = new route53.PrivateHostedZone(this, 'OriginZone', { zoneName: originTls.domainName, vpc });
+      new route53.ARecord(this, 'OriginRecord', { zone, target: route53.RecordTarget.fromAlias(new route53Targets.LoadBalancerTarget(services.alb)) });
+    }
+    const internalApiUrl = originTls ? `https://${originTls.domainName}` : `http://${services.alb.loadBalancerDnsName}`;
+
     const mcp = config.mcp.enabled
-      ? new McpEndpoint(this, 'Mcp', { foundation, alb: services.alb, listener: services.listener, albSecurityGroup: albSg })
+      ? new McpEndpoint(this, 'Mcp', { foundation, alb: services.alb, listener: services.listener, albSecurityGroup: albSg, apiUrl: internalApiUrl, port: originPort })
       : undefined;
 
     // ---- CloudFront (HTTPS, WAF) -> VPC origin -> internal ALB
@@ -153,8 +170,14 @@ export class CubeStack extends Stack {
       comment: `Cube API (${config.stackName})`,
       defaultBehavior: {
         origin: origins.VpcOrigin.withApplicationLoadBalancer(services.alb, {
-          httpPort: 80,
-          protocolPolicy: cloudfront.OriginProtocolPolicy.HTTP_ONLY,
+          ...(originTls
+            ? {
+                domainName: originTls.domainName,
+                httpsPort: 443,
+                protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+                originSslProtocols: [cloudfront.OriginSslPolicy.TLS_V1_2],
+              }
+            : { httpPort: 80, protocolPolicy: cloudfront.OriginProtocolPolicy.HTTP_ONLY }),
           readTimeout: Duration.seconds(60),
           keepaliveTimeout: Duration.seconds(60),
         }),
@@ -205,6 +228,9 @@ export class CubeStack extends Stack {
       alarm(`CubeStoreMemory${i}`, s.metricMemoryUtilization({ period: Duration.minutes(5) }), 90, `${s.node.id}: memory >= 90%`);
     }
     if (mcp) alarm('McpErrors', mcp.fn.metricErrors({ period: Duration.minutes(5) }), 5, 'MCP Lambda errors');
+
+    // ---- Audit and threat detection (security.cloudTrail / security.guardDuty)
+    new SecurityServices(this, 'Security', { config, foundation, alarmTopic: topic });
 
     // ---- Outputs
     new CfnOutput(this, 'CubeUrl', { value: baseUrl, description: 'Base URL (CloudFront, HTTPS)' });

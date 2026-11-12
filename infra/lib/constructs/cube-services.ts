@@ -1,4 +1,5 @@
 import { Duration } from 'aws-cdk-lib';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
@@ -32,6 +33,8 @@ export interface CubeServicesProps {
   dataSourceEnv: Record<string, string>;
   /** Security group of the CloudFront VPC origin side (ALB). */
   albSecurityGroup: ec2.SecurityGroup;
+  /** ACM certificate (main region) for an HTTPS:443 ALB listener. Undefined = HTTP:80 listener. */
+  originCertificate?: acm.ICertificate;
 }
 
 /**
@@ -61,8 +64,16 @@ export class CubeServices extends Construct {
     });
     props.confBucket.grantRead(this.taskRole, `${props.confPrefix}*`);
 
-    this.apiSecurityGroup = new ec2.SecurityGroup(this, 'ApiSg', { vpc, description: 'Cube API tasks', allowAllOutbound: true });
-    const refreshSg = new ec2.SecurityGroup(this, 'RefreshSg', { vpc, description: 'Cube refresh worker', allowAllOutbound: true });
+    // With the Athena demo every outbound call is HTTPS to AWS APIs. A custom data source can use any
+    // host/port (Postgres 5432, Redshift 5439, ...), so egress stays open there; see docs/security-review.md.
+    const openEgress = config.dataSource.type !== 'athena-demo';
+    this.apiSecurityGroup = new ec2.SecurityGroup(this, 'ApiSg', { vpc, description: 'Cube API tasks', allowAllOutbound: openEgress });
+    const refreshSg = new ec2.SecurityGroup(this, 'RefreshSg', { vpc, description: 'Cube refresh worker', allowAllOutbound: openEgress });
+    if (!openEgress) {
+      for (const sg of [this.apiSecurityGroup, refreshSg]) {
+        sg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'HTTPS to AWS APIs (S3, Athena, Glue, Secrets Manager, ECR, Logs)');
+      }
+    }
     cubestore.allowClient(this.apiSecurityGroup);
     cubestore.allowClient(refreshSg);
 
@@ -109,7 +120,9 @@ export class CubeServices extends Construct {
         runtimePlatform: { cpuArchitecture: ecs.CpuArchitecture.X86_64, operatingSystemFamily: ecs.OperatingSystemFamily.LINUX },
         volumes: [{ name: 'conf' }, { name: 'tmp' }],
       });
-      taskDef.node.addDependency(props.cubeImage.copy, props.awsCliImage.copy);
+      // Depend with the task definition resource only: the execution role must not wait for the image copy
+      // (the CMK policy references the role, and the KMS-encrypted repositories reference the CMK).
+      taskDef.node.defaultChild!.node.addDependency(props.cubeImage.copy, props.awsCliImage.copy);
 
       const init = taskDef.addContainer('conf-sync', {
         image: props.awsCliImage.image,
@@ -202,9 +215,10 @@ export class CubeServices extends Construct {
     this.alb.logAccessLogs(foundation.logsBucket, 'alb');
     this.apiSecurityGroup.addIngressRule(props.albSecurityGroup, ec2.Port.tcp(CUBE_PORT), 'ALB to Cube API');
 
-    this.listener = this.alb.addListener('Http', {
-      port: 80,
-      protocol: elbv2.ApplicationProtocol.HTTP,
+    this.listener = this.alb.addListener(props.originCertificate ? 'Https' : 'Http', {
+      ...(props.originCertificate
+        ? { port: 443, protocol: elbv2.ApplicationProtocol.HTTPS, certificates: [props.originCertificate], sslPolicy: elbv2.SslPolicy.RECOMMENDED_TLS }
+        : { port: 80, protocol: elbv2.ApplicationProtocol.HTTP }),
       open: false,
       defaultAction: elbv2.ListenerAction.fixedResponse(404, { contentType: 'application/json', messageBody: '{"error":"Not found"}' }),
     });

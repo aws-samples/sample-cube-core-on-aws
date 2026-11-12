@@ -1,6 +1,7 @@
 import { RemovalPolicy } from 'aws-cdk-lib';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as kms from 'aws-cdk-lib/aws-kms';
 import { DockerImageName, ECRDeployment } from 'cdk-ecr-deployment';
 import { Construct } from 'constructs';
 
@@ -13,22 +14,26 @@ export interface MirroredImage {
 /**
  * Mirrors public images (Docker Hub / ECR Public) into private ECR repositories, so that
  * tasks pull from ECR over VPC endpoints, images are scanned on push, tags are immutable,
+ * repositories are encrypted with the stack CMK,
  * and deployments do not depend on Docker Hub availability or rate limits.
  * No local Docker is required: the copy runs in a Lambda function during deployment.
  */
 export class ImageMirror extends Construct {
   private readonly removalPolicy: RemovalPolicy;
+  private readonly encryptionKey: kms.IKey;
 
-  constructor(scope: Construct, id: string, props: { removalPolicy: RemovalPolicy }) {
+  constructor(scope: Construct, id: string, props: { removalPolicy: RemovalPolicy; encryptionKey: kms.IKey }) {
     super(scope, id);
     this.removalPolicy = props.removalPolicy;
+    this.encryptionKey = props.encryptionKey;
   }
 
   mirror(id: string, source: string, tag: string): MirroredImage {
     const repo = new ecr.Repository(this, `${id}Repo`, {
       imageScanOnPush: true,
       imageTagMutability: ecr.TagMutability.IMMUTABLE,
-      encryption: ecr.RepositoryEncryption.AES_256,
+      encryption: ecr.RepositoryEncryption.KMS,
+      encryptionKey: this.encryptionKey,
       removalPolicy: this.removalPolicy,
       emptyOnDelete: this.removalPolicy === RemovalPolicy.DESTROY,
       lifecycleRules: [{ description: 'Keep the 10 most recent images', maxImageCount: 10 }],

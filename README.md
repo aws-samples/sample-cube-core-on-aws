@@ -157,15 +157,16 @@ Check your account quotas: fewer than 5 VPCs in the target region (the default l
 ./deploy.sh            # deploy after interactive confirmation
 ./deploy.sh --yes      # CI / non-interactive
 AWS_PROFILE=prod ./deploy.sh
+./deploy.sh --no-waf --no-guardduty   # turn off paid security services (see 7.8)
 ```
 
 The script runs these steps:
 
 1. Checks Node, the AWS CLI, and the current identity; on first run it creates `config.json` from `config.example.json`.
-2. Installs dependencies, runs the MCP server unit tests, and builds it.
-3. Runs `cdk bootstrap` as needed in the target region and in `us-east-1` (the WAF for CloudFront must live there).
+2. Installs dependencies, runs the MCP server unit tests, and builds it. Runs `npm audit --omit=dev --audit-level=high` for both packages and stops on high/critical findings (`--skip-audit` to bypass).
+3. Runs `cdk bootstrap` as needed in the target region and, when WAF is on, in `us-east-1` (the WAF for CloudFront must live there).
 4. `cdk synth`: also runs the **cdk-nag AwsSolutions** security checks and aborts if there are unsuppressed findings.
-5. `cdk deploy --all`: deploys `<stackName>-Waf` (us-east-1) first, then the main stack `<stackName>`. The first deployment takes about 15–20 minutes.
+5. `cdk deploy --all`: deploys `<stackName>-Waf` (us-east-1, when WAF is on) first, then the main stack `<stackName>`. The first deployment takes about 15–20 minutes.
 6. Smoke test: health check, unauthenticated request rejected, Playground not reachable, metadata and query working, MCP working.
 
 To change the region, sizing, or data source before deploying, edit `config.json` (fields in [section 6](#6-configuration-reference-configjson)). Minimal example:
@@ -460,6 +461,11 @@ After switching to a custom data source, remove the demo model from `cube/model`
 | `access.rateLimitPer5Min` | `2000` | Request limit per IP per 5 minutes |
 | `access.geoAllowList` | `[]` | CloudFront country/region allow list, for example `["CN","JP","US"]` |
 | `access.customDomain` | empty | `domainName` + `certificateArn` (ACM certificate in **us-east-1**). Enforces TLS 1.2+ when set. You create the DNS CNAME to the CloudFront domain yourself |
+| `access.originTls` | empty | `domainName` + `certificateArn` (ACM certificate in the **main region**). When set, CloudFront → ALB and MCP Lambda → ALB use HTTPS (TLS 1.2+). The stack creates a private hosted zone for `domainName` in the VPC; no public DNS record is needed |
+| `security.waf` | `true` | AWS WAF web ACL on CloudFront (`<stackName>-Waf` stack). `access.allowedCidrs` needs it. Paid, see 7.8 |
+| `security.cloudTrail` | `true` | Multi-Region CloudTrail trail into a KMS-encrypted bucket. Paid if the account already has a trail, see 7.8 |
+| `security.guardDuty` | `true` | Amazon GuardDuty detector in the main region. Paid, see 7.8 |
+| `security.vpcFlowLogs` | `true` | VPC Flow Logs (all traffic) for the new VPC, or for the VPC in `network.vpcId` |
 | `cube.api` | 1 vCPU / 2 GB, 2–6 tasks | API task size and auto scaling range |
 | `cube.refreshWorker` | 1 vCPU / 2 GB | Refresh Worker task size |
 | `cube.cubestoreRouter` | 1 vCPU / 4 GB | Cube Store Router task size |
@@ -474,7 +480,7 @@ After switching to a custom data source, remove the demo model from `cube/model`
 | `mcp.enabled` | `true` | Remote MCP |
 | `alarmEmail` | `""` | Alarm email (you must confirm the subscription from the email). Empty = alarms publish to the SNS topic with no subscriber |
 
-The configuration is validated. For example, a `latest` version, `CUBEJS_API_SECRET` / `CUBEJS_DB_PASS` / `CUBEJS_SQL_PASSWORD` / `CUBEJS_DEV_MODE` in plain-text env, a certificate outside us-east-1, `dataSource.type: custom` without `CUBEJS_DB_TYPE`, or `sqlApi.enabled` without `allowedCidrs` all fail with an error.
+The configuration is validated. For example, a `latest` version, `CUBEJS_DEV_MODE` or any credential-like variable (name ending in `PASS`, `PASSWORD`, `SECRET`, `TOKEN`, `PRIVATE_KEY`, `AWS_KEY`, `JWT_KEY`) in plain-text env, `access.allowedCidrs` with `security.waf: false`, a certificate outside us-east-1, `dataSource.type: custom` without `CUBEJS_DB_TYPE`, or `sqlApi.enabled` without `allowedCidrs` all fail with an error.
 
 ---
 
@@ -485,22 +491,23 @@ Designed according to the [AWS Well-Architected Security Pillar](https://docs.aw
 ### 7.1 Network isolation
 
 - All workload compute (ECS tasks and the MCP Lambda) runs in **private subnets** without public IPs; in a VPC created by the stack, the public subnets contain only NAT. CDK-managed deployment helper Lambdas (S3 asset copy, ECR image copy, bucket auto-delete) run outside the VPC.
-- The ALB is **internal** and reached through a **CloudFront VPC Origin**, so there is no origin directly reachable from the internet. ALB security group ingress allows only the `com.amazonaws.global.cloudfront.origin-facing` managed prefix list and the MCP Lambda security group.
+- The ALB is **internal** and reached through a **CloudFront VPC Origin**, so there is no origin directly reachable from the internet. ALB security group ingress allows only the `com.amazonaws.global.cloudfront.origin-facing` managed prefix list and the MCP Lambda security group, on port 80, or 443 with `access.originTls`.
 - **Minimal security groups**:
   - Cube API accepts traffic only from the ALB (4000) and the optional SQL NLB (15432).
   - Cube Store Router accepts only 3030 from Cube API / Refresh Worker; inter-node ports 9999 / 10001 are open only within the Cube Store security group.
-  - MCP Lambda egress is limited to ALB:80.
+  - MCP Lambda egress is limited to the ALB listener port.
+  - Cube Store egress: HTTPS (443) plus its own inter-node ports. Cube API / Refresh Worker egress with the Athena demo: HTTPS (443) plus Cube Store 3030. With `dataSource.type: custom` their egress stays open, because the database host and port are yours to choose.
 - The ALB routes only `/cubejs-api/*`, `/livez`, `/readyz`, and `/mcp`; every other path returns 404 (**Playground and dev-mode endpoints are unreachable**).
 - **VPC endpoints** (`network.vpcEndpoints`, on by default): traffic to S3, ECR, CloudWatch Logs, and Secrets Manager (plus Athena and Glue with the Athena demo) stays inside the VPC.
-- For a VPC created by the stack: VPC Flow Logs (all traffic, KMS-encrypted) and a locked-down default security group (`restrictDefaultSecurityGroup`). With `network.vpcId`, neither is configured by the stack.
+- VPC Flow Logs (all traffic, KMS-encrypted, `security.vpcFlowLogs`) for the new VPC or the VPC in `network.vpcId`. For a VPC created by the stack, the default security group is locked down (`restrictDefaultSecurityGroup`).
 
 ### 7.2 Edge protection
 
 - HTTPS only (`HTTPS_ONLY`), with HTTP/2 and HTTP/3; `TLSv1.2_2021` is enforced once a custom domain is configured.
-- **AWS WAF**:
+- **AWS WAF** (`security.waf`, on by default):
   - Three managed rule groups: `AmazonIpReputationList`, `CommonRuleSet`, `KnownBadInputsRuleSet`.
   - Per-IP rate limiting. Optional IP allow list: when `access.allowedCidrs` is set, the web ACL default action becomes block and only listed IPs are allowed.
-  - WAF logs go to CloudWatch with the **`authorization` header redacted**.
+  - WAF logs go to CloudWatch with the **`authorization` header redacted**, encrypted with a CMK in us-east-1.
   - `SizeRestrictions_QUERYSTRING/BODY` in `CommonRuleSet` are set to Count so long Cube JSON queries are not blocked by mistake.
 - Security response headers (HSTS, X-Content-Type-Options, X-Frame-Options, etc., via the CloudFront managed `SecurityHeadersPolicy`).
 - Caching disabled (`CachingDisabled`) so authenticated responses are never cached and served to other users.
@@ -510,9 +517,9 @@ Designed according to the [AWS Well-Architected Security Pillar](https://docs.aw
 - Cube API enforces JWT authentication and runs with dev mode off (`CUBEJS_DEV_MODE=false`).
 - The signing secret is randomly generated by Secrets Manager and **never appears in code, templates, or plain-text environment variables**; ECS injects it as a secret at start-up.
 - **Least-privilege IAM with one role per component**:
-  - Cube task role: read only the `conf/` prefix and (with the Athena demo) the demo data bucket; read/write the Athena results bucket; use only the designated Athena workgroup and Glue database/tables; decrypt with the stack CMK.
+  - Cube task role: read only the `conf/` prefix and (with the Athena demo) the demo data bucket; read and write (but not delete) in the Athena results bucket; use only the designated Athena workgroup and Glue database/tables; decrypt with the stack CMK.
   - Cube Store task role: read/write only the Cube Store bucket.
-  - MCP Lambda: no data permissions at all; it only forwards the caller's token.
+  - MCP Lambda: no data permissions at all; it only forwards the caller's token. `initialize` / `tools/list` requests, which never reach Cube data, are first checked against Cube, so an invalid token gets 401.
 - No long-lived access keys. Cube Store and Athena get temporary credentials through ECS task roles.
 - Tokens issued by `gen-token.mjs` expire after 24 hours by default, 90 days at most.
 
@@ -520,7 +527,9 @@ Designed according to the [AWS Well-Architected Security Pillar](https://docs.aw
 
 - **One customer managed KMS key (CMK) with automatic rotation**, used for:
   - All application S3 buckets (SSE-KMS + Bucket Key)
-  - CloudWatch log groups created by the stack (ECS containers, MCP Lambda, VPC Flow Logs). Not covered: the WAF log group in us-east-1 and the log groups that CDK helper Lambdas create automatically
+  - CloudWatch log groups created by the stack (ECS containers, MCP Lambda, VPC Flow Logs). The WAF log group in us-east-1 uses its own CMK there. Not covered: the log groups that CDK helper Lambdas create automatically
+  - Private ECR repositories
+  - CloudTrail log files
   - Secrets Manager
   - SNS
   - Lambda environment variables
@@ -535,7 +544,7 @@ Designed according to the [AWS Well-Architected Security Pillar](https://docs.aw
 
 ### 7.5 Runtime and supply chain
 
-- Image versions are pinned and mirrored into **private ECR**: vulnerability scanning on push, immutable tags (IMMUTABLE), last 10 images kept. Running tasks pull only from private ECR; Docker Hub and ECR Public are contacted only at deploy time, when images are copied.
+- Image versions are pinned and mirrored into **private ECR** (KMS-encrypted): vulnerability scanning on push, immutable tags (IMMUTABLE), last 10 images kept. Running tasks pull only from private ECR; Docker Hub and ECR Public are contacted only at deploy time, when images are copied.
 - The Cube API and Refresh Worker containers run as a **non-root user (UID 1000)** with a **read-only root filesystem**; only `/cube/conf` and `/tmp` have writable volumes. The short-lived `aws-cli` init container that syncs the data model runs with the image's default user.
 - ECS Exec is off by default. If you turn it on, audit it with CloudTrail.
 - Telemetry is disabled for Cube and Cube Store (`CUBEJS_TELEMETRY=false`, `CUBESTORE_TELEMETRY=false`).
@@ -543,7 +552,9 @@ Designed according to the [AWS Well-Architected Security Pillar](https://docs.aw
 ### 7.6 Observability and auditing
 
 - ECS Container Insights (Enhanced). All container logs go to CloudWatch Logs (KMS-encrypted). Container, MCP Lambda, VPC Flow Log, and WAF log groups keep logs for 30 days in dev and 1 year in prod.
-- ALB and CloudFront access logs and S3 access logs (in the access-log bucket), VPC Flow Logs (new VPC only), WAF logs.
+- ALB and CloudFront access logs and S3 access logs (in the access-log bucket), VPC Flow Logs, WAF logs.
+- **AWS CloudTrail** (`security.cloudTrail`): a multi-Region trail with management events, global service events, and log file validation, into a KMS-encrypted, versioned, access-logged S3 bucket (kept 90 days in dev, 365 in prod).
+- **Amazon GuardDuty** (`security.guardDuty`): a detector in the main region. Findings with severity ≥ 7 go to the alarm SNS topic through an EventBridge rule. The rule is created even when `security.guardDuty` is false, so it also forwards findings from a detector you already run.
 - Alarms (SNS, KMS-encrypted; notifications are delivered only if `alarmEmail` is set or you subscribe to `AlarmTopicArn`):
   - API 5xx (≥ 10 per 5 minutes)
   - Unhealthy targets (≥ 1)
@@ -558,11 +569,52 @@ Designed according to the [AWS Well-Architected Security Pillar](https://docs.aw
 | Item | Current state | Hardening |
 |---|---|---|
 | TLS policy on the default CloudFront domain | Minimum version cannot be enforced (AWS limitation) | Configure `access.customDomain` |
-| CloudFront → ALB | The VPC Origin uses HTTP, but traffic stays on the AWS network and the ALB is not internet-reachable | For end-to-end TLS: add an ACM certificate and HTTPS listener to the ALB and switch the VPC Origin to HTTPS_ONLY |
+| CloudFront → ALB, MCP Lambda → ALB | HTTP by default; traffic stays on the AWS network and the ALB is not internet-reachable | Set `access.originTls` (domain name + ACM certificate in the main region): HTTPS listener with TLS 1.2+, VPC Origin HTTPS_ONLY |
+| Cube API / Refresh Worker egress with `dataSource.type: custom` | Open (database host and port are not known to the stack) | Edit `infra/lib/constructs/cube-services.ts` to allow only your database port and 443 |
 | Traffic inside the VPC (ALB → Cube, Cube → Cube Store) | Plain text, confined to private subnets and restricted by security groups | If compliance requires it, use ECS Service Connect TLS or add TLS at the application layer |
 | SQL API | NLB passes plain TCP (Postgres protocol TLS negotiation is incompatible with NLB TLS termination) | Allow only internal CIDRs; access via VPN / Direct Connect |
 | API secret rotation | Not rotated automatically (rotation invalidates all tokens immediately) | Rotate manually on a schedule (see 8.5), or switch to JWKS (the IdP handles rotation) |
 | Cube Store containers | Run as root (as in the official image) | Run only in private subnets; security groups restrict access to Cube components |
+
+### 7.8 Security switches, account-level services, and cost
+
+Paid security services are **on by default**. Turn each one off in `config.json` (`security.*`), with a `deploy.sh` flag, or with CDK context; a flag or context value overrides `config.json`:
+
+| Switch | `deploy.sh` flag | CDK context |
+|---|---|---|
+| `security.waf` | `--no-waf` | `-c security.waf=false` |
+| `security.cloudTrail` | `--no-cloudtrail` | `-c security.cloudTrail=false` |
+| `security.guardDuty` | `--no-guardduty` | `-c security.guardDuty=false` |
+| `security.vpcFlowLogs` | `--no-vpc-flow-logs` | `-c security.vpcFlowLogs=false` |
+
+If you run `cdk` yourself, pass the same `-c` values to `cdk synth`, `cdk deploy` and `cdk destroy`.
+
+**GuardDuty and CloudTrail are account-level services that may already be on.**
+
+- **GuardDuty** allows one detector per account and Region. If one already exists (enabled by you, by AWS Organizations, or by another stack), creating a second fails the deployment with "a detector already exists". `deploy.sh` checks with `aws guardduty list-detectors` and, if the existing detector does not belong to this stack, skips creating one and prints a message. With `cdk deploy` directly, set `-c security.guardDuty=false`. If you later turn the switch off after the stack created the detector, the next deployment **deletes** that detector and its findings.
+- **CloudTrail** never fails on a second trail (up to 5 trails per Region), but the first copy of management events is free and every additional copy is billed. `deploy.sh` warns when a multi-Region trail from outside this stack already exists. If your organization already has an organization trail, use `--no-cloudtrail`.
+- **WAF** can be turned off when a central WAF (for example an AWS Firewall Manager policy) already protects the distribution. Every API call still needs a valid Cube JWT. Turning WAF off on an existing deployment leaves the `<stackName>-Waf` stack in us-east-1; delete it with `aws cloudformation delete-stack --region us-east-1 --stack-name <stackName>-Waf` after the main stack is updated.
+
+**Added cost (us-east-1 list prices, check the pricing pages):**
+
+| Service | Price | Typical dev account |
+|---|---|---|
+| AWS WAF | $5 per web ACL + $1 per rule (4 rules) per month, $0.60 per 1M requests | about $9 / month + requests |
+| WAF log CMK (us-east-1) | $1 per key per month | $1 / month |
+| CloudTrail | First copy of management events free; additional copies $2.00 per 100,000 events; S3 storage and KMS requests | $0–5 / month |
+| GuardDuty | 30-day free trial, then per volume: CloudTrail management events $4.00 / 1M, VPC Flow Log and DNS analysis $1.00 / GB (first 500 GB), S3 data events $0.80 / 1M | a few dollars / month at low traffic |
+| VPC Flow Logs | CloudWatch Logs vended-log ingestion from $0.50 / GB, plus storage | depends on traffic |
+| Private hosted zone (`access.originTls` only) | $0.50 per zone per month | $0.50 / month |
+
+See [AWS WAF](https://aws.amazon.com/waf/pricing/), [CloudTrail](https://aws.amazon.com/cloudtrail/pricing/), [GuardDuty](https://aws.amazon.com/guardduty/pricing/) and [CloudWatch](https://aws.amazon.com/cloudwatch/pricing/) pricing.
+
+**Upgrading an existing deployment:** the private ECR repositories now use KMS encryption. CloudFormation cannot change the encryption of a repository, so the update creates new repositories and copies the images again. In `prod`, the old repositories are retained and can be deleted by hand.
+
+### 7.9 Security checks
+
+- `docs/security-review.md`: the security review this hardening is based on (findings, severity, location, fix).
+- `scripts/security-check.sh`: runs without AWS credentials: `npm audit --audit-level=high`, type checks and unit tests for `mcp-server` and `infra`. The `infra` tests synthesize the stacks with a dummy account, so **cdk-nag runs on every switch combination**, and check that the security resources exist.
+- `.github/workflows/security.yml` runs that script on every pull request, on pushes to `main`, and weekly. `.github/dependabot.yml` opens weekly update PRs for npm packages and GitHub Actions.
 
 ---
 
@@ -630,12 +682,14 @@ Rough estimate for the default `dev` configuration in `ap-northeast-1` / `us-eas
 | VPC Interface Endpoints ×6 × 2 AZ | | 90 |
 | ALB | | 20 + LCU |
 | CloudFront + WAF | 3 managed rule groups + 1 rate-limit rule | 10 + requests |
+| CloudTrail, GuardDuty, WAF log CMK | see 7.8 | 5–15 |
 | KMS, Secrets Manager, CloudWatch, S3, Athena | | 10–20 |
-| **Total** | | **About 400–450 / month** |
+| **Total** | | **About 405–465 / month** |
 
 Ways to save:
 
 - Turn off `network.vpcEndpoints` to save about $90 (AWS API traffic goes through NAT instead).
+- Turn off security services you already run centrally (`--no-guardduty`, `--no-cloudtrail`, `--no-waf`, see 7.8).
 - API `minCount: 1`.
 - Reduce Cube Store workers to 1.
 - Run `./destroy.sh` when you are done with a dev environment.
@@ -687,7 +741,10 @@ sample-cube-core-on-aws/
 ├── sample-data/orders/          # Athena demo data (CSV)
 ├── scripts/
 │   ├── gen-token.mjs            # Issues Cube JWTs with the secret from Secrets Manager
-│   └── smoke-test.sh            # Post-deployment smoke test
+│   ├── smoke-test.sh            # Post-deployment smoke test
+│   └── security-check.sh        # npm audit + tests + offline synth with cdk-nag (also run in CI)
+├── docs/security-review.md      # Security review: findings and fixes
+├── .github/                     # CI security workflow and Dependabot
 ├── mcp-server/                  # MCP server (TypeScript)
 │   ├── src/server.ts            #   Tool definitions (list/describe/query/generate_sql)
 │   ├── src/cube-client.ts       #   Cube REST client (handles Continue wait)
@@ -695,18 +752,21 @@ sample-cube-core-on-aws/
 │   ├── src/stdio.ts             #   Local: stdio
 │   └── test/                    #   Unit tests (node --test)
 └── infra/                       # AWS CDK (TypeScript)
-    ├── bin/app.ts               #   Entry point: WAF stack (us-east-1) + main stack + cdk-nag
+    ├── bin/app.ts               #   Entry point: reads config + CDK context switches
+    ├── lib/build-app.ts         #   WAF stack (us-east-1, optional) + main stack + cdk-nag
     ├── lib/config.ts            #   Configuration loading and validation
     ├── lib/cube-stack.ts        #   Main stack: ECR, secrets, CloudFront, alarms, outputs
     ├── lib/waf-stack.ts         #   WAF web ACL
     ├── lib/nag-suppressions.ts  #   cdk-nag suppressions (with justifications)
+    ├── test/                    #   Synth + cdk-nag tests (node --test)
     └── lib/constructs/
         ├── foundation.ts        #   KMS, VPC, Flow Logs, VPC endpoints, log bucket
         ├── images.ts            #   Public images → private ECR
         ├── cubestore.ts         #   Cube Store router + workers
         ├── cube-services.ts     #   Cube API, Refresh Worker, internal ALB, SQL API
         ├── athena-demo.ts       #   Demo dataset, Glue, Athena workgroup
-        └── mcp.ts               #   MCP Lambda
+        ├── mcp.ts               #   MCP Lambda
+        └── security.ts          #   CloudTrail, GuardDuty, findings → SNS
 ```
 
 ## Security

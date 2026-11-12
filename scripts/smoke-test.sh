@@ -44,5 +44,8 @@ if [ "$mcp_code" = "404" ]; then
   echo "  - MCP endpoint disabled"
 else
   check "MCP tools/call cube_list_models" "$mcp_code" "200"
+  check "MCP rejects an invalid token" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/mcp" \
+    -H 'Authorization: Bearer invalid' -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" "401"
 fi
 exit $fail

@@ -1,4 +1,6 @@
-import { ArnFormat, CfnOutput, RemovalPolicy, Stack, StackProps } from 'aws-cdk-lib';
+import { ArnFormat, CfnOutput, Duration, RemovalPolicy, Stack, StackProps } from 'aws-cdk-lib';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import { Construct } from 'constructs';
@@ -74,11 +76,32 @@ export class CubeWafStack extends Stack {
       visibilityConfig: { sampledRequestsEnabled: true, cloudWatchMetricsEnabled: true, metricName: `${config.stackName}-waf` },
     });
 
+    // WAF logs live in us-east-1, so they get their own CMK (the main stack key is regional).
+    const removalPolicy = isProd ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY;
+    const key = new kms.Key(this, 'LogsKey', {
+      description: `Cube on AWS (${config.stackName}) WAF log encryption key`,
+      enableKeyRotation: true,
+      removalPolicy,
+      pendingWindow: Duration.days(isProd ? 30 : 7),
+    });
+    key.addToResourcePolicy(
+      new iam.PolicyStatement({
+        sid: 'AllowCloudWatchLogs',
+        principals: [new iam.ServicePrincipal(`logs.${this.region}.amazonaws.com`)],
+        actions: ['kms:Encrypt*', 'kms:Decrypt*', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:Describe*'],
+        resources: ['*'],
+        conditions: {
+          ArnLike: { 'kms:EncryptionContext:aws:logs:arn': `arn:${this.partition}:logs:${this.region}:${this.account}:*` },
+        },
+      }),
+    );
+
     // WAF log group names must start with "aws-waf-logs-".
     const logGroup = new logs.LogGroup(this, 'WafLogs', {
       logGroupName: `aws-waf-logs-${config.stackName}`,
+      encryptionKey: key,
       retention: isProd ? logs.RetentionDays.ONE_YEAR : logs.RetentionDays.ONE_MONTH,
-      removalPolicy: isProd ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+      removalPolicy,
     });
     new wafv2.CfnLoggingConfiguration(this, 'WafLogging', {
       resourceArn: acl.attrArn,

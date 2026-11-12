@@ -59,6 +59,40 @@ export class Foundation extends Construct {
         conditions: { StringEquals: { 'aws:SourceAccount': stack.account } },
       }),
     );
+    // EventBridge delivers GuardDuty findings to the encrypted alarm topic.
+    this.key.addToResourcePolicy(
+      new iam.PolicyStatement({
+        sid: 'AllowEventBridgeToPublishToEncryptedSns',
+        principals: [new iam.ServicePrincipal('events.amazonaws.com')],
+        actions: ['kms:Decrypt', 'kms:GenerateDataKey*'],
+        resources: ['*'],
+        conditions: { StringEquals: { 'aws:SourceAccount': stack.account } },
+      }),
+    );
+    if (config.security.cloudTrail) {
+      const trailArn = `arn:${stack.partition}:cloudtrail:*:${stack.account}:trail/*`;
+      this.key.addToResourcePolicy(
+        new iam.PolicyStatement({
+          sid: 'AllowCloudTrailToEncryptLogs',
+          principals: [new iam.ServicePrincipal('cloudtrail.amazonaws.com')],
+          actions: ['kms:GenerateDataKey*'],
+          resources: ['*'],
+          conditions: {
+            StringEquals: { 'aws:SourceAccount': stack.account },
+            StringLike: { 'kms:EncryptionContext:aws:cloudtrail:arn': trailArn },
+          },
+        }),
+      );
+      this.key.addToResourcePolicy(
+        new iam.PolicyStatement({
+          sid: 'AllowCloudTrailToDescribeKey',
+          principals: [new iam.ServicePrincipal('cloudtrail.amazonaws.com')],
+          actions: ['kms:DescribeKey'],
+          resources: ['*'],
+          conditions: { StringEquals: { 'aws:SourceAccount': stack.account } },
+        }),
+      );
+    }
 
     // ---- Access logs bucket (SSE-S3 is required by S3 server access logging and ALB access logs;
     // ACLs are required by CloudFront standard logging).
@@ -76,15 +110,24 @@ export class Foundation extends Construct {
       autoDeleteObjects: !this.isProd,
     });
 
-    // ---- VPC
+    // ---- VPC (flow logs: all traffic, KMS-encrypted log group)
+    const flowLogGroup = config.security.vpcFlowLogs
+      ? new logs.LogGroup(this, 'VpcFlowLogs', {
+          encryptionKey: this.key,
+          retention: this.logRetention,
+          removalPolicy: this.removalPolicy,
+        })
+      : undefined;
     if (config.network.vpcId) {
       this.vpc = ec2.Vpc.fromLookup(this, 'Vpc', { vpcId: config.network.vpcId });
+      if (flowLogGroup) {
+        new ec2.FlowLog(this, 'VpcFlowLog', {
+          resourceType: ec2.FlowLogResourceType.fromVpc(this.vpc),
+          destination: ec2.FlowLogDestination.toCloudWatchLogs(flowLogGroup),
+          trafficType: ec2.FlowLogTrafficType.ALL,
+        });
+      }
     } else {
-      const flowLogGroup = new logs.LogGroup(this, 'VpcFlowLogs', {
-        encryptionKey: this.key,
-        retention: this.logRetention,
-        removalPolicy: this.removalPolicy,
-      });
       this.vpc = new ec2.Vpc(this, 'Vpc', {
         ipAddresses: ec2.IpAddresses.cidr(config.network.vpcCidr),
         maxAzs: config.network.maxAzs,
@@ -94,9 +137,9 @@ export class Foundation extends Construct {
           { name: 'public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24, mapPublicIpOnLaunch: false },
           { name: 'private', subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS, cidrMask: 20 },
         ],
-        flowLogs: {
-          all: { destination: ec2.FlowLogDestination.toCloudWatchLogs(flowLogGroup), trafficType: ec2.FlowLogTrafficType.ALL },
-        },
+        flowLogs: flowLogGroup
+          ? { all: { destination: ec2.FlowLogDestination.toCloudWatchLogs(flowLogGroup), trafficType: ec2.FlowLogTrafficType.ALL } }
+          : {},
       });
     }
 

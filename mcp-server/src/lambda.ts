@@ -4,6 +4,7 @@
  *
  * Authentication: the caller sends `Authorization: Bearer <Cube JWT>`. The token is passed
  * through to Cube unchanged, so Cube verifies it and applies the caller's security context.
+ * Requests that would not reach Cube (initialize, tools/list) are checked against Cube first.
  * The Lambda itself never holds the Cube API secret.
  */
 import type { ALBEvent, ALBResult } from 'aws-lambda';
@@ -20,6 +21,17 @@ const jsonRpcError = (statusCode: number, message: string, extraHeaders: Record<
   body: JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message }, id: null }),
   isBase64Encoded: false,
 });
+
+/** True when the body is one JSON-RPC message, or a batch, made only of tools/call requests. */
+function onlyToolCalls(rawBody: string): boolean {
+  try {
+    const parsed = JSON.parse(rawBody);
+    const messages = Array.isArray(parsed) ? parsed : [parsed];
+    return messages.length > 0 && messages.every((m) => m?.method === 'tools/call');
+  } catch {
+    return false;
+  }
+}
 
 export async function handler(event: ALBEvent): Promise<ALBResult> {
   const headers = Object.fromEntries(
@@ -53,7 +65,22 @@ export async function handler(event: ALBEvent): Promise<ALBResult> {
     body: rawBody,
   });
 
-  const server = createCubeMcpServer(new CubeClient({ baseUrl: CUBE_API_URL, token, timeoutMs: 25_000 }));
+  const client = new CubeClient({ baseUrl: CUBE_API_URL, token, timeoutMs: 25_000 });
+
+  // tools/call always reaches Cube, which verifies the token. Other methods (initialize, tools/list, ...)
+  // never touch Cube, so verify the token first: a bearer that is merely present is not authentication.
+  if (!onlyToolCalls(rawBody)) {
+    let valid: boolean;
+    try {
+      valid = await client.verifyToken();
+    } catch (err) {
+      console.error('Token verification failed', err);
+      return jsonRpcError(502, 'Could not verify the token with Cube');
+    }
+    if (!valid) return jsonRpcError(401, 'Invalid or expired Cube JWT', { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
+  }
+
+  const server = createCubeMcpServer(client);
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,

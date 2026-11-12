@@ -46,11 +46,13 @@ export class CubeStore extends Construct {
     this.securityGroup = new ec2.SecurityGroup(this, 'Sg', {
       vpc: foundation.vpc,
       description: 'Cube Store router and workers',
-      allowAllOutbound: true,
+      allowAllOutbound: false,
     });
     // Router <-> workers traffic stays within the Cube Store security group.
-    this.securityGroup.addIngressRule(this.securityGroup, ec2.Port.tcp(META_PORT), 'Cube Store metastore');
-    this.securityGroup.addIngressRule(this.securityGroup, ec2.Port.tcp(WORKER_PORT), 'Cube Store workers');
+    this.securityGroup.connections.allowInternally(ec2.Port.tcp(META_PORT), 'Cube Store metastore');
+    this.securityGroup.connections.allowInternally(ec2.Port.tcp(WORKER_PORT), 'Cube Store workers');
+    // Everything else Cube Store calls (S3, ECR, CloudWatch Logs) is HTTPS.
+    this.securityGroup.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'HTTPS to AWS APIs (S3, ECR, CloudWatch Logs)');
 
     const role = new iam.Role(this, 'TaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
@@ -81,7 +83,7 @@ export class CubeStore extends Construct {
         taskRole: role,
         runtimePlatform: { cpuArchitecture: ecs.CpuArchitecture.X86_64, operatingSystemFamily: ecs.OperatingSystemFamily.LINUX },
       });
-      taskDef.node.addDependency(image.copy);
+      taskDef.node.defaultChild!.node.addDependency(image.copy); // resource only, see cube-services.ts
       taskDef.addContainer('cubestore', {
         image: image.image,
         environment: { ...commonEnv, ...env },
@@ -129,6 +131,6 @@ export class CubeStore extends Construct {
 
   /** Allows Cube API / refresh worker tasks to reach the router. */
   allowClient(sg: ec2.ISecurityGroup): void {
-    this.securityGroup.addIngressRule(sg, ec2.Port.tcp(CUBESTORE_HTTP_PORT), 'Cube API/refresh worker to Cube Store router');
+    this.securityGroup.connections.allowFrom(sg, ec2.Port.tcp(CUBESTORE_HTTP_PORT), 'Cube API/refresh worker to Cube Store router');
   }
 }

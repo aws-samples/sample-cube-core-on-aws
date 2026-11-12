@@ -21,7 +21,18 @@
     "customDomain": {
       "domainName": "",
       "certificateArn": ""
+    },
+    "originTls": {
+      "domainName": "",
+      "certificateArn": ""
     }
+  },
+
+  "security": {
+    "waf": true,
+    "cloudTrail": true,
+    "guardDuty": true,
+    "vpcFlowLogs": true
   },
 
   "cube": {

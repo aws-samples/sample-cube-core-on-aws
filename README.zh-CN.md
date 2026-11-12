@@ -154,15 +154,16 @@ Cube 是一个 **语义层（Semantic Layer）**。它位于数据仓库/数据�
 ./deploy.sh            # 交互确认后部署
 ./deploy.sh --yes      # CI / 非交互
 AWS_PROFILE=prod ./deploy.sh
+./deploy.sh --no-waf --no-guardduty   # 关闭收费的安全服务（见 7.8）
 ```
 
 脚本依次执行：
 
 1. 检查 Node、AWS CLI 和当前身份；首次运行会从 `config.example.json` 生成 `config.json`。
-2. 安装依赖，跑 MCP Server 单元测试并构建。
-3. 在目标 region 和 `us-east-1`（CloudFront 的 WAF 必须在这里）按需执行 `cdk bootstrap`。
+2. 安装依赖，跑 MCP Server 单元测试并构建。对两个包执行 `npm audit --omit=dev --audit-level=high`，发现 high/critical 漏洞就中止（`--skip-audit` 可跳过）。
+3. 在目标 region，以及开启 WAF 时在 `us-east-1`（CloudFront 的 WAF 必须在这里）按需执行 `cdk bootstrap`。
 4. `cdk synth`：同时跑 **cdk-nag AwsSolutions** 安全检查，有未豁免的问题就中止部署。
-5. `cdk deploy --all`：先部署 `<stackName>-Waf`（us-east-1），再部署主栈 `<stackName>`。首次约 15–20 分钟。
+5. `cdk deploy --all`：先部署 `<stackName>-Waf`（us-east-1，开启 WAF 时），再部署主栈 `<stackName>`。首次约 15–20 分钟。
 6. 冒烟测试：健康检查、未授权请求被拒、Playground 不可访问、元数据和查询正常、MCP 正常。
 
 部署前想改 region、规模、数据源，就编辑 `config.json`（字段见 [第 6 节](#6-配置参考-configjson)）。最小示例：
@@ -457,6 +458,11 @@ aws secretsmanager create-secret --name cube/redshift \
 | `access.rateLimitPer5Min` | `2000` | 每个 IP 每 5 分钟的请求上限 |
 | `access.geoAllowList` | `[]` | CloudFront 国家/地区白名单，比如 `["CN","JP","US"]` |
 | `access.customDomain` | 空 | `domainName` + `certificateArn`（**us-east-1** 的 ACM 证书）。配置后强制 TLS 1.2+。DNS 需要你自己 CNAME 到 CloudFront 域名 |
+| `access.originTls` | 空 | `domainName` + `certificateArn`（**主 region** 的 ACM 证书）。配置后 CloudFront → ALB、MCP Lambda → ALB 都走 HTTPS（TLS 1.2+）。栈会在 VPC 里为 `domainName` 建私有托管区，不需要公网 DNS 记录 |
+| `security.waf` | `true` | CloudFront 上的 AWS WAF Web ACL（`<stackName>-Waf` 栈）。`access.allowedCidrs` 依赖它。收费，见 7.8 |
+| `security.cloudTrail` | `true` | 多 Region CloudTrail trail，日志写入 KMS 加密的桶。账号里已有 trail 时会产生费用，见 7.8 |
+| `security.guardDuty` | `true` | 在主 region 创建 Amazon GuardDuty detector。收费，见 7.8 |
+| `security.vpcFlowLogs` | `true` | 为新建 VPC 或 `network.vpcId` 指定的 VPC 开启 VPC Flow Logs（全部流量） |
 | `cube.api` | 1 vCPU / 2 GB，2–6 个 | API 规格和自动扩缩范围 |
 | `cube.refreshWorker` | 1 vCPU / 2 GB | Refresh Worker 规格 |
 | `cube.cubestoreRouter` | 1 vCPU / 4 GB | Cube Store Router 规格 |
@@ -471,7 +477,7 @@ aws secretsmanager create-secret --name cube/redshift \
 | `mcp.enabled` | `true` | 远程 MCP |
 | `alarmEmail` | `""` | 告警邮箱（需要在邮件里点确认订阅）。为空时告警只发到没有订阅者的 SNS 主题 |
 
-配置会做校验，比如：`latest` 版本、把 `CUBEJS_API_SECRET` / `CUBEJS_DB_PASS` / `CUBEJS_SQL_PASSWORD` / `CUBEJS_DEV_MODE` 写进明文 env、证书不在 us-east-1、`dataSource.type: custom` 却没有 `CUBEJS_DB_TYPE`、开启 `sqlApi.enabled` 却没有 `allowedCidrs` 等情况，都会直接报错。
+配置会做校验，比如：`latest` 版本、把 `CUBEJS_DEV_MODE` 或任何像凭证的变量（名字以 `PASS`、`PASSWORD`、`SECRET`、`TOKEN`、`PRIVATE_KEY`、`AWS_KEY`、`JWT_KEY` 结尾）写进明文 env、`security.waf: false` 却设置了 `access.allowedCidrs`、证书不在 us-east-1、`dataSource.type: custom` 却没有 `CUBEJS_DB_TYPE`、开启 `sqlApi.enabled` 却没有 `allowedCidrs` 等情况，都会直接报错。
 
 ---
 
@@ -482,22 +488,23 @@ aws secretsmanager create-secret --name cube/redshift \
 ### 7.1 网络隔离
 
 - 所有业务计算资源（ECS 任务和 MCP Lambda）都在**私有子网**，不分配公网 IP；栈新建的 VPC 中，公有子网里只有 NAT。CDK 管理的部署辅助 Lambda（S3 资产复制、ECR 镜像复制、桶自动清空）在 VPC 外运行。
-- ALB 是 **internal** 类型，通过 **CloudFront VPC Origin** 接入，公网上没有可直连的源站。ALB 安全组入站只放行 `com.amazonaws.global.cloudfront.origin-facing` 托管前缀列表和 MCP Lambda 的安全组。
+- ALB 是 **internal** 类型，通过 **CloudFront VPC Origin** 接入，公网上没有可直连的源站。ALB 安全组入站只放行 `com.amazonaws.global.cloudfront.origin-facing` 托管前缀列表和 MCP Lambda 的安全组，端口为 80（配置 `access.originTls` 时为 443）。
 - **最小化安全组**：
   - Cube API 只接受 ALB（4000）和可选 SQL NLB（15432）的流量。
   - Cube Store Router 只接受 Cube API / Refresh Worker 的 3030；节点间的 9999 / 10001 只在 Cube Store 安全组内部互通。
-  - MCP Lambda 出站只能访问 ALB:80。
+  - MCP Lambda 出站只能访问 ALB 的监听端口。
+  - Cube Store 出站：HTTPS（443）加节点间端口。使用 Athena demo 时，Cube API / Refresh Worker 出站：HTTPS（443）加 Cube Store 3030。`dataSource.type: custom` 时这两者出站不限制，因为数据库地址和端口由你决定。
 - ALB 只路由 `/cubejs-api/*`、`/livez`、`/readyz`、`/mcp`，其他路径一律 404（**Playground 和开发模式接口不可达**）。
 - **VPC Endpoints**（`network.vpcEndpoints`，默认开启）：访问 S3、ECR、CloudWatch Logs、Secrets Manager（使用 Athena demo 时还有 Athena、Glue）的流量不出 VPC。
-- 栈新建的 VPC：开启 VPC Flow Logs（全部流量，KMS 加密），并收紧默认安全组（`restrictDefaultSecurityGroup`）。使用 `network.vpcId` 时，栈不配置这两项。
+- VPC Flow Logs（全部流量，KMS 加密，`security.vpcFlowLogs`）：新建 VPC 和 `network.vpcId` 指定的 VPC 都会开启。栈新建的 VPC 还会收紧默认安全组（`restrictDefaultSecurityGroup`）。
 
 ### 7.2 边缘防护
 
 - 只接受 HTTPS（`HTTPS_ONLY`），支持 HTTP/2 和 HTTP/3；配置自定义域名后强制 `TLSv1.2_2021`。
-- **AWS WAF**：
+- **AWS WAF**（`security.waf`，默认开启）：
   - `AmazonIpReputationList`、`CommonRuleSet`、`KnownBadInputsRuleSet` 三组托管规则。
   - 按 IP 限流。可选 IP 白名单：设置 `access.allowedCidrs` 后，Web ACL 默认动作改为拦截，只放行名单内的 IP。
-  - WAF 日志写入 CloudWatch，并**脱敏 `authorization` 头**。
+  - WAF 日志写入 CloudWatch，并**脱敏 `authorization` 头**，用 us-east-1 的 CMK 加密。
   - `CommonRuleSet` 中的 `SizeRestrictions_QUERYSTRING/BODY` 改为 Count 模式，避免误拦较长的 Cube JSON 查询。
 - 安全响应头（HSTS、X-Content-Type-Options、X-Frame-Options 等，用 CloudFront 托管的 `SecurityHeadersPolicy`）。
 - 关闭缓存（`CachingDisabled`），防止带鉴权的响应被缓存后串给其他用户。
@@ -507,9 +514,9 @@ aws secretsmanager create-secret --name cube/redshift \
 - Cube API 强制 JWT 认证，并关闭开发模式（`CUBEJS_DEV_MODE=false`）。
 - 签名密钥由 Secrets Manager 随机生成，**不出现在代码、模板和环境变量明文里**，ECS 启动时以 secret 方式注入。
 - **IAM 最小权限，按组件拆分角色**：
-  - Cube Task Role：只能读 `conf/` 前缀和（使用 Athena demo 时）demo 数据桶；读写 Athena 结果桶；只能使用指定的 Athena Workgroup 和 Glue 库表；可用栈的 CMK 解密。
+  - Cube Task Role：只能读 `conf/` 前缀和（使用 Athena demo 时）demo 数据桶；读、写（不能删除）Athena 结果桶；只能使用指定的 Athena Workgroup 和 Glue 库表；可用栈的 CMK 解密。
   - Cube Store Task Role：只能读写 Cube Store 桶。
-  - MCP Lambda：没有任何业务权限，只透传调用方 token。
+  - MCP Lambda：没有任何业务权限，只透传调用方 token。`initialize` / `tools/list` 这类不访问 Cube 数据的请求，会先拿 token 找 Cube 校验，无效 token 返回 401。
 - 不使用任何长期 AK/SK。Cube Store 和 Athena 都通过 ECS Task Role 拿临时凭证。
 - `gen-token.mjs` 签发的 token 默认 24 小时过期，最长 90 天。
 
@@ -517,7 +524,9 @@ aws secretsmanager create-secret --name cube/redshift \
 
 - **一个客户托管 KMS 密钥（CMK），开启自动轮换**，用于：
   - 所有业务 S3 桶（SSE-KMS + Bucket Key）
-  - 栈创建的 CloudWatch 日志组（ECS 容器、MCP Lambda、VPC Flow Logs）。不包括 us-east-1 的 WAF 日志组，以及 CDK 辅助 Lambda 自动创建的日志组
+  - 栈创建的 CloudWatch 日志组（ECS 容器、MCP Lambda、VPC Flow Logs）。us-east-1 的 WAF 日志组用那里单独的 CMK。不包括 CDK 辅助 Lambda 自动创建的日志组
+  - 私有 ECR 仓库
+  - CloudTrail 日志文件
   - Secrets Manager
   - SNS
   - Lambda 环境变量
@@ -532,7 +541,7 @@ aws secretsmanager create-secret --name cube/redshift \
 
 ### 7.5 运行时与供应链
 
-- 镜像版本锁定，并镜像到**私有 ECR**：push 时扫描漏洞，tag 不可变（IMMUTABLE），保留最近 10 个镜像。运行中的任务只从私有 ECR 拉取镜像；只有部署时复制镜像才会访问 Docker Hub 和 ECR Public。
+- 镜像版本锁定，并镜像到**私有 ECR**（KMS 加密）：push 时扫描漏洞，tag 不可变（IMMUTABLE），保留最近 10 个镜像。运行中的任务只从私有 ECR 拉取镜像；只有部署时复制镜像才会访问 Docker Hub 和 ECR Public。
 - Cube API 和 Refresh Worker 容器以**非 root 用户（UID 1000）**运行，**根文件系统只读**，只有 `/cube/conf` 和 `/tmp` 挂了可写卷。负责同步数据模型的短时 `aws-cli` init 容器使用镜像默认用户运行。
 - 默认关闭 ECS Exec。打开时请配合 CloudTrail 审计。
 - 关闭 Cube 和 Cube Store 的遥测（`CUBEJS_TELEMETRY=false`、`CUBESTORE_TELEMETRY=false`）。
@@ -540,7 +549,9 @@ aws secretsmanager create-secret --name cube/redshift \
 ### 7.6 可观测性和审计
 
 - ECS Container Insights（Enhanced）。所有容器日志进 CloudWatch Logs（KMS 加密）。容器、MCP Lambda、VPC Flow Logs 和 WAF 的日志组在 dev 保留 30 天，prod 保留 1 年。
-- ALB 和 CloudFront 访问日志、S3 访问日志（写入访问日志桶）、VPC Flow Logs（仅新建 VPC）、WAF 日志。
+- ALB 和 CloudFront 访问日志、S3 访问日志（写入访问日志桶）、VPC Flow Logs、WAF 日志。
+- **AWS CloudTrail**（`security.cloudTrail`）：多 Region trail，记录管理事件和全局服务事件，开启日志文件校验，写入 KMS 加密、开启版本控制和访问日志的 S3 桶（dev 保留 90 天，prod 保留 365 天）。
+- **Amazon GuardDuty**（`security.guardDuty`）：在主 region 创建 detector。严重度 ≥ 7 的 finding 经 EventBridge 规则发到告警 SNS 主题。`security.guardDuty` 为 false 时也会创建这条规则，这样你已有的 detector 产生的 finding 也会转发过来。
 - 告警（SNS，KMS 加密；只有设置了 `alarmEmail` 或你自己订阅了 `AlarmTopicArn`，才会收到通知）：
   - API 5xx（每 5 分钟 ≥ 10 次）
   - 不健康目标（≥ 1）
@@ -555,11 +566,52 @@ aws secretsmanager create-secret --name cube/redshift \
 | 项 | 现状 | 加固方式 |
 |---|---|---|
 | CloudFront 默认域名的 TLS 策略 | 无法强制最低版本（AWS 限制） | 配置 `access.customDomain` |
-| CloudFront → ALB | VPC Origin 走 HTTP，但流量在 AWS 内网，ALB 不可公网访问 | 需要端到端 TLS 时：给 ALB 加 ACM 证书和 HTTPS 监听器，并把 VPC Origin 改为 HTTPS_ONLY |
+| CloudFront → ALB、MCP Lambda → ALB | 默认走 HTTP；流量在 AWS 内网，ALB 不可公网访问 | 配置 `access.originTls`（域名 + 主 region 的 ACM 证书）：HTTPS 监听器、TLS 1.2+，VPC Origin 改为 HTTPS_ONLY |
+| `dataSource.type: custom` 时 Cube API / Refresh Worker 的出站 | 不限制（栈不知道数据库地址和端口） | 修改 `infra/lib/constructs/cube-services.ts`，只放行你的数据库端口和 443 |
 | VPC 内部流量（ALB → Cube、Cube → Cube Store） | 明文，只在私有子网、经安全组限制 | 有合规要求时用 ECS Service Connect TLS，或在应用层加 TLS |
 | SQL API | NLB 走 TCP 明文（Postgres 协议的 TLS 协商和 NLB TLS 终结不兼容） | 只放行内网 CIDR，通过 VPN / Direct Connect 访问 |
 | API secret 轮换 | 不自动轮换（轮换后所有 token 立刻失效） | 定期手动轮换（见 8.5），或改用 JWKS（IdP 负责轮换） |
 | Cube Store 容器 | 以 root 运行（官方镜像如此） | 只在私有子网运行，安全组限制为仅 Cube 内部访问 |
+
+### 7.8 安全开关、账号级服务和费用
+
+收费的安全服务**默认开启**。可以在 `config.json`（`security.*`）、`deploy.sh` 参数或 CDK context 里关闭；参数和 context 优先于 `config.json`：
+
+| 开关 | `deploy.sh` 参数 | CDK context |
+|---|---|---|
+| `security.waf` | `--no-waf` | `-c security.waf=false` |
+| `security.cloudTrail` | `--no-cloudtrail` | `-c security.cloudTrail=false` |
+| `security.guardDuty` | `--no-guardduty` | `-c security.guardDuty=false` |
+| `security.vpcFlowLogs` | `--no-vpc-flow-logs` | `-c security.vpcFlowLogs=false` |
+
+自己执行 `cdk` 时，`cdk synth`、`cdk deploy`、`cdk destroy` 要带上同样的 `-c` 参数。
+
+**GuardDuty 和 CloudTrail 是账号级服务，账号里可能已经开着。**
+
+- **GuardDuty** 每个账号每个 Region 只能有一个 detector。已有 detector（你自己开的、AWS Organizations 统一开的、或别的栈建的）时再建一个，部署会失败，报 "a detector already exists"。`deploy.sh` 会用 `aws guardduty list-detectors` 检查：已有的 detector 不属于本栈时，就不再创建并打印提示。直接用 `cdk deploy` 时，请加 `-c security.guardDuty=false`。如果本栈已经建了 detector，之后又把开关关掉，下次部署会**删除**这个 detector 和它的 finding。
+- **CloudTrail** 多建一个 trail 不会失败（每个 Region 最多 5 个），但管理事件只有第一份免费，多出来的每一份都收费。账号里已有不属于本栈的多 Region trail 时，`deploy.sh` 会提示。组织已有 organization trail 时，请用 `--no-cloudtrail`。
+- **WAF**：已有统一的 WAF（例如 AWS Firewall Manager 策略）保护这个 distribution 时可以关闭。关闭后每个 API 请求仍需要有效的 Cube JWT。在已有部署上关闭 WAF 后，us-east-1 的 `<stackName>-Waf` 栈不会自动删除；主栈更新完后执行 `aws cloudformation delete-stack --region us-east-1 --stack-name <stackName>-Waf`。
+
+**新增费用（us-east-1 标价，以官网定价页为准）：**
+
+| 服务 | 价格 | 典型 dev 账号 |
+|---|---|---|
+| AWS WAF | 每个 Web ACL $5 + 每条规则 $1（共 4 条）/ 月，每百万请求 $0.60 | 约 $9 / 月 + 请求量 |
+| WAF 日志 CMK（us-east-1） | 每个密钥 $1 / 月 | $1 / 月 |
+| CloudTrail | 第一份管理事件免费；额外副本每 10 万事件 $2.00；另有 S3 存储和 KMS 请求费用 | $0–5 / 月 |
+| GuardDuty | 30 天免费试用，之后按量：CloudTrail 管理事件 $4.00 / 百万，VPC Flow Log 和 DNS 分析 $1.00 / GB（前 500 GB），S3 数据事件 $0.80 / 百万 | 低流量时每月几美元 |
+| VPC Flow Logs | CloudWatch Logs vended log 写入 $0.50 / GB 起，另加存储 | 取决于流量 |
+| 私有托管区（仅 `access.originTls`） | 每个托管区 $0.50 / 月 | $0.50 / 月 |
+
+定价见 [AWS WAF](https://aws.amazon.com/waf/pricing/)、[CloudTrail](https://aws.amazon.com/cloudtrail/pricing/)、[GuardDuty](https://aws.amazon.com/guardduty/pricing/)、[CloudWatch](https://aws.amazon.com/cloudwatch/pricing/)。
+
+**升级已有部署**：私有 ECR 仓库改为 KMS 加密。CloudFormation 不能修改已有仓库的加密方式，所以更新时会新建仓库并重新复制镜像。`prod` 环境下旧仓库会被保留，可以手动删除。
+
+### 7.9 安全检查
+
+- `docs/security-review.md`：本次加固依据的安全评审报告（发现、严重程度、位置、修复方式）。
+- `scripts/security-check.sh`：不需要 AWS 凭证，对 `mcp-server` 和 `infra` 执行 `npm audit --audit-level=high`、类型检查和单元测试。`infra` 的测试用虚拟账号 synth 整个应用，**每种开关组合都会跑 cdk-nag**，并检查安全资源是否存在。
+- `.github/workflows/security.yml` 在每个 PR、推送到 `main` 时以及每周执行这个脚本。`.github/dependabot.yml` 每周为 npm 包和 GitHub Actions 发起更新 PR。
 
 ---
 
@@ -627,12 +679,14 @@ aws ecs update-service --cluster <ClusterName> --service <RefreshService> --forc
 | VPC Interface Endpoints ×6 × 2 AZ | | 90 |
 | ALB | | 20 + LCU |
 | CloudFront + WAF | 3 组托管规则 + 1 条限流规则 | 10 + 请求量 |
+| CloudTrail、GuardDuty、WAF 日志 CMK | 见 7.8 | 5–15 |
 | KMS、Secrets Manager、CloudWatch、S3、Athena | | 10–20 |
-| **合计** | | **约 400–450 / 月** |
+| **合计** | | **约 405–465 / 月** |
 
 省钱选项：
 
 - 关闭 `network.vpcEndpoints`，省约 $90（AWS API 流量改走 NAT）。
+- 关闭已在组织层面统一开启的安全服务（`--no-guardduty`、`--no-cloudtrail`、`--no-waf`，见 7.8）。
 - API `minCount: 1`。
 - Cube Store Worker 减到 1 个。
 - 开发环境用完执行 `./destroy.sh`。
@@ -684,7 +738,10 @@ sample-cube-core-on-aws/
 ├── sample-data/orders/          # Athena demo 数据（CSV）
 ├── scripts/
 │   ├── gen-token.mjs            # 用 Secrets Manager 中的密钥签发 Cube JWT
-│   └── smoke-test.sh            # 部署后冒烟测试
+│   ├── smoke-test.sh            # 部署后冒烟测试
+│   └── security-check.sh        # npm audit + 测试 + 离线 synth 跑 cdk-nag（CI 也执行）
+├── docs/security-review.md      # 安全评审报告：发现与修复
+├── .github/                     # CI 安全检查工作流和 Dependabot
 ├── mcp-server/                  # MCP Server（TypeScript）
 │   ├── src/server.ts            #   工具定义（list/describe/query/generate_sql）
 │   ├── src/cube-client.ts       #   Cube REST 客户端（处理 Continue wait）
@@ -692,18 +749,21 @@ sample-cube-core-on-aws/
 │   ├── src/stdio.ts             #   本地：stdio
 │   └── test/                    #   单元测试（node --test）
 └── infra/                       # AWS CDK（TypeScript）
-    ├── bin/app.ts               #   入口：WAF 栈 (us-east-1) + 主栈 + cdk-nag
+    ├── bin/app.ts               #   入口：读取配置和 CDK context 开关
+    ├── lib/build-app.ts         #   WAF 栈（us-east-1，可选）+ 主栈 + cdk-nag
     ├── lib/config.ts            #   配置加载与校验
     ├── lib/cube-stack.ts        #   主栈：ECR、Secrets、CloudFront、告警、输出
     ├── lib/waf-stack.ts         #   WAF Web ACL
     ├── lib/nag-suppressions.ts  #   cdk-nag 豁免（附理由）
+    ├── test/                    #   synth + cdk-nag 测试（node --test）
     └── lib/constructs/
         ├── foundation.ts        #   KMS、VPC、Flow Logs、VPC Endpoints、日志桶
         ├── images.ts            #   公共镜像 → 私有 ECR
         ├── cubestore.ts         #   Cube Store Router + Workers
         ├── cube-services.ts     #   Cube API、Refresh Worker、内网 ALB、SQL API
         ├── athena-demo.ts       #   Demo 数据集、Glue、Athena Workgroup
-        └── mcp.ts               #   MCP Lambda
+        ├── mcp.ts               #   MCP Lambda
+        └── security.ts          #   CloudTrail、GuardDuty、finding → SNS
 ```
 
 ## 安全
